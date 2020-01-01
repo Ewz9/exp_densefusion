@@ -58,19 +58,28 @@ opt = parser.parse_args()
 
 def main():
     # g13: parameter setting -------------------
+    '''
+    posemodel is trained_checkpoints/linemod/pose_model_9_0.01310166542980859.pth
+    refine model is trained_checkpoints/linemod/pose_refine_model_493_0.006761023565178073.pth
+
+    '''
     opt.dataset ='linemod'
     opt.dataset_root = './datasets/linemod/Linemod_preprocessed'
     estimator_path = 'trained_checkpoints/linemod/pose_model_9_0.01310166542980859.pth'
     refiner_path = 'trained_checkpoints/linemod/pose_refine_model_493_0.006761023565178073.pth'
-    opt.resume_posenet = estimator_path
-    opt.resume_posenet = refiner_path
+    opt.model = estimator_path
+    opt.refine_model = refiner_path
     dataset_config_dir = 'datasets/linemod/dataset_config'
     output_result_dir = 'experiments/eval_result/linemod'
+    opt.refine_start = True
     bs = 1 #fixed because of the default setting in torch.utils.data.DataLoader
-    opt.iteration = 2 #default is 4 in eval_linemod.py
+    opt.iteration = 4 #default is 4 in eval_linemod.py
+    t1_start = False
     t1_idx = 0
     t1_total_eval_num = 3
-    
+    t2_start = True
+    t2_target_list = [193, 271, 368,410, 471, 472, 610, 1035, 1051, 1116, 1129, 1135]
+    #t2_target_list = [0, 1]
     axis_range = 0.1   # the length of X, Y, and Z axis in 3D
     vimg_dir = 'verify_img'
     if not os.path.exists(vimg_dir):
@@ -97,30 +106,19 @@ def main():
     estimator.cuda()
     refiner = PoseRefineNet(num_points = opt.num_points, num_obj = opt.num_objects)
     refiner.cuda()
+    
+    
+   
+    estimator.load_state_dict(torch.load(estimator_path))
 
-    if opt.resume_posenet != '':
-        estimator.load_state_dict(torch.load(estimator_path))
+    
+    refiner.load_state_dict(torch.load(refiner_path))
+    opt.refine_start = True
+    
 
-    if opt.resume_refinenet != '':
-        refiner.load_state_dict(torch.load(refiner_path))
-        opt.refine_start = True
-        opt.decay_start = True
-        opt.lr *= opt.lr_rate
-        opt.w *= opt.w_rate
-        opt.batch_size = int(opt.batch_size / opt.iteration)
-        optimizer = optim.Adam(refiner.parameters(), lr=opt.lr)
-    else:
-        opt.refine_start = False
-        opt.decay_start = False
-        optimizer = optim.Adam(estimator.parameters(), lr=opt.lr)
-
-
-    if opt.dataset == 'ycb':
-        test_dataset = PoseDataset_ycb('test', opt.num_points, False, opt.dataset_root, 0.0, opt.refine_start)
-    elif opt.dataset == 'linemod':
-        test_dataset = PoseDataset_linemod('test', opt.num_points, False, opt.dataset_root, 0.0, opt.refine_start)
+    test_dataset = PoseDataset_linemod('test', opt.num_points, False, opt.dataset_root, 0.0, opt.refine_start)
     testdataloader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=opt.workers)
-    print('complete loading testing loader\n')
+    
     opt.sym_list = test_dataset.get_sym_list()
     opt.num_points_mesh = test_dataset.get_num_points_mesh()
 
@@ -128,8 +126,7 @@ def main():
         length of the testing set: {0}\nnumber of sample points on mesh: {1}\n\
         symmetry object list: {2}'\
         .format( len(test_dataset), opt.num_points_mesh, opt.sym_list))
-    
-    
+   
     
     #load pytorch model
     estimator.eval()    
@@ -141,8 +138,10 @@ def main():
     #Pose estimation
     for j, data in enumerate(testdataloader, 0):
         # g13: modify this part for evaluation target--------------------
-        if j == t1_total_eval_num:
+        if t1_start and j == t1_total_eval_num:
             break
+        if t2_start and not (j in t2_target_list):
+            continue
         #----------------------------------------------------------------
         points, choose, img, target, model_points, idx = data
         if len(points.size()) == 2:
@@ -199,6 +198,7 @@ def main():
 
         # g13: start drawing pose on image------------------------------------
         # pick up image
+        print('{0}:\nmy_r is {1}\nmy_t is {2}\n'.format(j, my_r, my_t))    
         print("index {0}: {1}".format(j, test_dataset.list_rgb[j]))
         img = Image.open(test_dataset.list_rgb[j])
         
@@ -207,7 +207,18 @@ def main():
         meta = {}
         meta = yaml.load(meta_file)
         which_item = test_dataset.list_rank[j]
-        bbx = meta[which_item][0]['obj_bb']
+        which_obj = test_dataset.list_obj[j]
+        which_dict = 0
+        dict_leng = len(meta[which_item])
+        #print('get meta[{0}][{1}][obj_bb]'.format(which_item, which_obj))
+        k_idx = 0
+        while 1:
+            if meta[which_item][k_idx]['obj_id'] == which_obj:
+                which_dict = k_idx
+                break
+            k_idx = k_idx+1
+        
+        bbx = meta[which_item][which_dict]['obj_bb']
         draw = ImageDraw.Draw(img) 
         
         # draw box (ensure this is the right object)
@@ -250,9 +261,47 @@ def main():
         #img.show()
         
         #save file under file 
-        img_file_name = '{0}/pred_obj{1}_pic{2}.png'.format(vimg_dir, test_dataset.list_obj[j], which_item)
+        img_file_name = '{0}/batch{1}_pred_obj{2}_pic{3}.png'.format(vimg_dir, j, test_dataset.list_obj[j], which_item)
         img.save( img_file_name, "PNG" )
         img.close()
+        
+        # plot ground true ----------------------------
+        img = Image.open(test_dataset.list_rgb[j])
+        draw = ImageDraw.Draw(img) 
+        draw.line((bbx[0],bbx[1], bbx[0], bbx[1]+bbx[3]), fill=(255,0,0), width=5)
+        draw.line((bbx[0],bbx[1], bbx[0]+bbx[2], bbx[1]), fill=(255,0,0), width=5)
+        draw.line((bbx[0],bbx[1]+bbx[3], bbx[0]+bbx[2], bbx[1]+bbx[3]), fill=(255,0,0), width=5)
+        draw.line((bbx[0]+bbx[2],bbx[1], bbx[0]+bbx[2], bbx[1]+bbx[3]), fill=(255,0,0), width=5)        
+        target_r = np.resize(np.array(meta[which_item][k_idx]['cam_R_m2c']), (3, 3))                
+        target_t = np.array(meta[which_item][k_idx]['cam_t_m2c'])
+        target_t = target_t[np.newaxis, :]               
+        cam_extrinsic_GT = np.concatenate((target_r, target_t.T), axis=1)
+        
+        
+        #get center 3D
+        cam2d_3d_GT = np.matmul(cam_intrinsic, cam_extrinsic_GT)
+        cen_3d_GT = np.matmul(np.linalg.pinv(cam2d_3d_GT), [[c_x],[c_y],[1]])
+        
+        #transpose three 3D axis point into 2D
+        x_3d = cen_3d_GT + [[axis_range],[0],[0],[0]]
+        y_3d = cen_3d_GT + [[0],[axis_range],[0],[0]]
+        z_3d = cen_3d_GT + [[0],[0],[axis_range],[0]]
+        
+        x_2d = np.matmul(cam2d_3d_GT, x_3d)
+        y_2d = np.matmul(cam2d_3d_GT, y_3d)
+        z_2d = np.matmul(cam2d_3d_GT, z_3d)
+
+        #draw the axis on 2D
+        draw.line((c_x, c_y, x_2d[0], x_2d[1]), fill=(255,255,0), width=5)
+        draw.line((c_x, c_y, y_2d[0], y_2d[1]), fill=(0,255,0), width=5)
+        draw.line((c_x, c_y, z_2d[0], z_2d[1]), fill=(0,0,255), width=5)
+        print('pred:\n{0}\nGT:\n{1}\n'.format(cam_extrinsic,cam_extrinsic_GT))
+        print('pred 3D:{0}\nGT 3D:{1}\n'.format(cen_3d, cen_3d_GT))
+        img_file_name = '{0}/batch{1}_pred_obj{2}_pic{3}_gt.png'.format(vimg_dir, j, test_dataset.list_obj[j], which_item)
+        img.save( img_file_name, "PNG" )
+        img.close()
+        meta_file.close()
+    print('\nplot_result_img.py completed the task\n')
 if __name__ == '__main__':
     main()
     
