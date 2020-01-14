@@ -36,6 +36,7 @@ import matplotlib as plt
 from lib.transformations import euler_matrix, quaternion_matrix, quaternion_from_matrix
 import copy
 import yaml
+from lib.knn.__init__ import KNearestNeighbor
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', type=str, default = 'ycb', help='ycb or linemod')
@@ -63,6 +64,8 @@ def main():
     refine model is trained_checkpoints/linemod/pose_refine_model_493_0.006761023565178073.pth
 
     '''
+    objlist = [1, 2, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15]
+    knn = KNearestNeighbor(1)
     opt.dataset ='linemod'
     opt.dataset_root = './datasets/linemod/Linemod_preprocessed'
     estimator_path = 'trained_checkpoints/linemod/pose_model_9_0.01310166542980859.pth'
@@ -73,15 +76,21 @@ def main():
     output_result_dir = 'experiments/eval_result/linemod'
     opt.refine_start = True
     bs = 1 #fixed because of the default setting in torch.utils.data.DataLoader
-    opt.iteration = 4 #default is 4 in eval_linemod.py
-    t1_start = False
+    opt.iteration = 2 #default is 4 in eval_linemod.py
+    t1_start = True
     t1_idx = 0
     t1_total_eval_num = 3
-    t2_start = True
-    t2_target_list = [193, 271, 368,410, 471, 472, 610, 1035, 1051, 1116, 1129, 1135]
+    t2_start = False
+    t2_target_list = [22, 30, 172, 187, 267, 363, 410, 471, 472, 605, 644, 712, 1046, 1116, 1129, 1135, 1263]
     #t2_target_list = [0, 1]
     axis_range = 0.1   # the length of X, Y, and Z axis in 3D
     vimg_dir = 'verify_img'
+    diameter = []
+    meta_file = open('{0}/models_info.yml'.format(dataset_config_dir), 'r')
+    meta_d = yaml.load(meta_file)
+    for obj in objlist:
+        diameter.append(meta_d[obj]['diameter'] / 1000.0 * 0.1)
+    print(diameter)
     if not os.path.exists(vimg_dir):
         os.makedirs(vimg_dir)
     #-------------------------------------------
@@ -106,16 +115,11 @@ def main():
     estimator.cuda()
     refiner = PoseRefineNet(num_points = opt.num_points, num_obj = opt.num_objects)
     refiner.cuda()
-    
-    
-   
-    estimator.load_state_dict(torch.load(estimator_path))
-
-    
+  
+    estimator.load_state_dict(torch.load(estimator_path))    
     refiner.load_state_dict(torch.load(refiner_path))
     opt.refine_start = True
     
-
     test_dataset = PoseDataset_linemod('test', opt.num_points, False, opt.dataset_root, 0.0, opt.refine_start)
     testdataloader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=opt.workers)
     
@@ -195,10 +199,37 @@ def main():
             my_pred = np.append(my_r_final, my_t_final)
             my_r = my_r_final
             my_t = my_t_final
-
+            # Here 'my_pred' is the final pose estimation result after refinement ('my_r': quaternion, 'my_t': translation)
+        
+        #g13: checking the dis value
+        success_count = [0 for i in range(opt.num_objects)]
+        num_count = [0 for i in range(opt.num_objects)]
+        model_points = model_points[0].cpu().detach().numpy()
+        my_r = quaternion_matrix(my_r)[:3, :3]
+        pred = np.dot(model_points, my_r.T) + my_t
+        target = target[0].cpu().detach().numpy()
+    
+        if idx[0].item() in opt.sym_list:
+            pred = torch.from_numpy(pred.astype(np.float32)).cuda().transpose(1, 0).contiguous()
+            target = torch.from_numpy(target.astype(np.float32)).cuda().transpose(1, 0).contiguous()
+            inds = knn(target.unsqueeze(0), pred.unsqueeze(0))
+            target = torch.index_select(target, 1, inds.view(-1) - 1)
+            dis = torch.mean(torch.norm((pred.transpose(1, 0) - target.transpose(1, 0)), dim=1), dim=0).item()
+        else:
+            dis = np.mean(np.linalg.norm(pred - target, axis=1))
+    
+        if dis < diameter[idx[0].item()]:
+            success_count[idx[0].item()] += 1
+            print('No.{0} Pass! Distance: {1}'.format(j, dis))
+            fw.write('No.{0} Pass! Distance: {1}\n'.format(j, dis))
+        else:
+            print('No.{0} NOT Pass! Distance: {1}'.format(j, dis))
+            fw.write('No.{0} NOT Pass! Distance: {1}\n'.format(j, dis))
+        num_count[idx[0].item()] += 1
+        
         # g13: start drawing pose on image------------------------------------
         # pick up image
-        print('{0}:\nmy_r is {1}\nmy_t is {2}\n'.format(j, my_r, my_t))    
+        print('{0}:\nmy_r is {1}\nmy_t is {2}\ndis:{3}'.format(j, my_r, my_t, dis.item()))    
         print("index {0}: {1}".format(j, test_dataset.list_rgb[j]))
         img = Image.open(test_dataset.list_rgb[j])
         
@@ -231,6 +262,7 @@ def main():
         c_x = bbx[0]+int(bbx[2]/2)
         c_y = bbx[1]+int(bbx[3]/2)
         draw.point((c_x,c_y), fill=(255,255,0))
+        print('center:({0},{1})'.format(c_x, c_y))
         
         #get the 3D position of center
         cam_intrinsic = np.zeros((3,3))
@@ -256,7 +288,15 @@ def main():
         draw.line((c_x, c_y, x_2d[0], x_2d[1]), fill=(255,255,0), width=5)
         draw.line((c_x, c_y, y_2d[0], y_2d[1]), fill=(0,255,0), width=5)
         draw.line((c_x, c_y, z_2d[0], z_2d[1]), fill=(0,0,255), width=5)
-
+        
+        #g13: draw the estimate pred obj
+        for pti in pred:
+            pti.transpose()
+            pti_2d = np.matmul(cam_intrinsic, pti)
+            #print('({0},{1})\n'.format(int(pti_2d[0]),int(pti_2d[1])))
+            draw.point([int(pti_2d[0]),int(pti_2d[1])], fill=(255,255,0))
+            
+        
         #g13: show image
         #img.show()
         
@@ -295,6 +335,8 @@ def main():
         draw.line((c_x, c_y, x_2d[0], x_2d[1]), fill=(255,255,0), width=5)
         draw.line((c_x, c_y, y_2d[0], y_2d[1]), fill=(0,255,0), width=5)
         draw.line((c_x, c_y, z_2d[0], z_2d[1]), fill=(0,0,255), width=5)
+      
+       
         print('pred:\n{0}\nGT:\n{1}\n'.format(cam_extrinsic,cam_extrinsic_GT))
         print('pred 3D:{0}\nGT 3D:{1}\n'.format(cen_3d, cen_3d_GT))
         img_file_name = '{0}/batch{1}_pred_obj{2}_pic{3}_gt.png'.format(vimg_dir, j, test_dataset.list_obj[j], which_item)
